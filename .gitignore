@@ -1,0 +1,8 @@
+.build/
+build/
+.swiftpm/
+.DS_Store
+__pycache__/
+*.m4a
+*.wav
+voices.json
