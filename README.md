@@ -59,6 +59,12 @@ Your own voice is always "Me" (it comes from your mic).
 - Without headphones the mic also hears the call. The transcript drops obvious echoes; headphones
   avoid it entirely.
 - Live captions use one language at a time (menu). The final transcript auto-detects.
+- Problems that would lose a recording turn the menu bar dot **orange**, show a ⚠ line at the top
+  of the menu (with **Dismiss warning**) and post a notification:
+  - under 2 GB free during a call: warning, recording continues;
+  - under 300 MB free, or a failed audio write: recording stops and is finalized, so what was
+    recorded so far still transcribes. A new call doesn't start recording until there's space again;
+  - a meeting folder left without `meta.json` (MeetRec died mid-call): flagged at the next launch.
 
 ## CLI (testing)
 

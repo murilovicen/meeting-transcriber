@@ -8,6 +8,9 @@ final class TrackWriter {
     private let start: Double
     private var file: AVAudioFile?
     private var written: AVAudioFramePosition = 0
+    private var failed = false
+    /// Called once, on the audio thread, when the track can no longer be written (e.g. disk full).
+    var onFailure: ((Error) -> Void)?
 
     init(url: URL, start: Double) {
         self.url = url
@@ -16,6 +19,7 @@ final class TrackWriter {
 
     func write(_ buffer: AVAudioPCMBuffer, hostSeconds: Double) {
         let format = buffer.format
+        if failed { return }
         if file == nil {
             let settings: [String: Any] = [
                 AVFormatIDKey: kAudioFormatMPEG4AAC,
@@ -26,7 +30,7 @@ final class TrackWriter {
                 file = try AVAudioFile(forWriting: url, settings: settings,
                                        commonFormat: format.commonFormat, interleaved: format.isInterleaved)
             } catch {
-                log("could not open \(url.lastPathComponent): \(error)")
+                fail(error, "could not open")
                 return
             }
         }
@@ -43,7 +47,7 @@ final class TrackWriter {
                 for b in UnsafeMutableAudioBufferListPointer(silence.mutableAudioBufferList) {
                     if let d = b.mData { memset(d, 0, Int(b.mDataByteSize)) }
                 }
-                try? file.write(from: silence)
+                do { try file.write(from: silence) } catch { fail(error, "write failed for"); return }
                 written += AVAudioFramePosition(n)
                 gap -= AVAudioFramePosition(n)
             }
@@ -52,8 +56,16 @@ final class TrackWriter {
             try file.write(from: buffer)
             written += AVAudioFramePosition(buffer.frameLength)
         } catch {
-            log("write failed for \(url.lastPathComponent): \(error)")
+            fail(error, "write failed for")
         }
+    }
+
+    /// Stop writing and close the file, so whatever made it to disk can still be finalized.
+    private func fail(_ error: Error, _ what: String) {
+        failed = true
+        file = nil
+        log("\(what) \(url.lastPathComponent): \(error)")
+        onFailure?(error)
     }
 
     func close() { file = nil }
@@ -70,6 +82,10 @@ final class Recorder {
     /// Extra consumers of each track (live captions). Set before start().
     var onMic: ((AVAudioPCMBuffer) -> Void)?
     var onSystem: ((AVAudioPCMBuffer) -> Void)?
+    /// A track stopped writing. Called on an audio thread. Set before start().
+    var onWriteFailure: ((Error) -> Void)? {
+        didSet { mic.onFailure = onWriteFailure; system.onFailure = onWriteFailure }
+    }
 
     init(dir: URL) {
         self.dir = dir

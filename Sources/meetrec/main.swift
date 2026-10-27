@@ -2,6 +2,7 @@ import AppKit
 import AVFoundation
 import Foundation
 import ServiceManagement
+import UserNotifications
 
 let outRoot = URL(fileURLWithPath: ProcessInfo.processInfo.environment["MEETREC_OUT"]
                   ?? NSHomeDirectory() + "/Meetings")
@@ -10,6 +11,28 @@ let pollSeconds: UInt64 = 2
 let startAfterPolls = 2          // mic busy for ~4s before we start
 let stopAfterSeconds = 20.0      // mic free for 20s before we call it over
 let minMeetingSeconds = 60.0     // shorter auto-recordings are discarded
+let lowDiskBytes: Int64 = 2_000_000_000   // warn below this much free space
+let stopDiskBytes: Int64 = 300_000_000    // stop and finalize the recording below this (an hour of audio is ~60 MB)
+
+func freeDiskBytes() -> Int64? {
+    (try? outRoot.resourceValues(forKeys: [.volumeAvailableCapacityKey]).volumeAvailableCapacity).map(Int64.init)
+}
+
+func gb(_ bytes: Int64) -> String { String(format: "%.1f GB", Double(bytes) / 1e9) }
+
+/// Banner for problems you'd otherwise only find in the log after the call.
+func notify(_ title: String, _ body: String) {
+    guard Bundle.main.bundleIdentifier != nil else { return }  // the notification center aborts outside an .app
+    let c = UNUserNotificationCenter.current()
+    c.requestAuthorization(options: [.alert, .sound]) { granted, _ in
+        guard granted else { return }
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        c.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+    }
+}
 
 func log(_ msg: String) {
     let f = DateFormatter()
@@ -17,9 +40,11 @@ func log(_ msg: String) {
     let line = "[\(f.string(from: Date()))] \(msg)\n"
     print(line, terminator: "")
     try? FileManager.default.createDirectory(at: outRoot, withIntermediateDirectories: true)
+    // The throwing FileHandle API: the old seekToEndOfFile()/write(_:) raise an ObjC exception
+    // on a full disk, which aborted the app mid-call and left both recordings unplayable.
     if let h = try? FileHandle(forWritingTo: logURL) {
-        h.seekToEndOfFile()
-        h.write(line.data(using: .utf8)!)
+        _ = try? h.seekToEnd()
+        try? h.write(contentsOf: Data(line.utf8))
         try? h.close()
     } else {
         try? line.write(to: logURL, atomically: true, encoding: .utf8)
@@ -67,6 +92,9 @@ final class Controller {
     private(set) var manual = false
     private(set) var transcribing = 0
     private(set) var lastTranscript: URL? = Controller.newestTranscript()
+    /// Something went wrong that you need to know about; shown in the menu bar until dismissed.
+    private(set) var problem: String?
+    private var warnedLowDisk = false
 
     /// Survive restarts: the newest meeting folder that has a transcript.
     static func newestTranscript() -> URL? {
@@ -150,13 +178,70 @@ final class Controller {
     }
     private let liveSink = LiveSink()
 
+    func warn(_ msg: String) {
+        log("⚠ \(msg)")
+        problem = msg
+        notify("MeetRec", msg)
+        onChange()
+    }
+
+    func dismissProblem() {
+        problem = nil
+        onChange()
+    }
+
+    /// The app can die without finalizing (a crash, a forced quit): those folders have audio but no meta.json.
+    func checkInterrupted() {
+        let dirs = (try? FileManager.default.contentsOfDirectory(at: outRoot, includingPropertiesForKeys: nil)) ?? []
+        guard let last = dirs.filter({ $0.hasDirectoryPath }).max(by: { $0.lastPathComponent < $1.lastPathComponent }),
+              FileManager.default.fileExists(atPath: last.appendingPathComponent("me.m4a").path),
+              !FileManager.default.fileExists(atPath: last.appendingPathComponent("meta.json").path),
+              UserDefaults.standard.string(forKey: "warnedInterrupted") != last.lastPathComponent
+        else { return }
+        UserDefaults.standard.set(last.lastPathComponent, forKey: "warnedInterrupted")
+        warn("The \(last.lastPathComponent) recording was cut off: MeetRec quit unexpectedly. The audio may be unreadable.")
+    }
+
+    private func clock() -> String {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
+        return f.string(from: Date())
+    }
+
+    private func recordingFailed(_ r: Recorder, _ error: Error) {
+        guard recorder === r else { return }
+        end()
+        let free = freeDiskBytes().map { ", \(gb($0)) free" } ?? ""
+        warn("Recording stopped at \(clock()): could not write audio (\((error as NSError).code)\(free)). What was recorded up to then is saved.")
+    }
+
+    /// Runs every poll: warn when space gets low, and stop cleanly before the disk is actually full.
+    private func checkDisk() {
+        guard let free = freeDiskBytes() else { return }
+        if free < stopDiskBytes, recorder != nil {
+            end()
+            warn("Disk is full (\(gb(free)) free). Recording stopped at \(clock()) and saved up to that point. Free up space.")
+        } else if free < lowDiskBytes, recorder != nil, !warnedLowDisk {
+            warnedLowDisk = true
+            warn("Disk is almost full (\(gb(free)) free). Recording continues, but it will stop below \(gb(stopDiskBytes)).")
+        }
+    }
+
     func begin(app: String, manual: Bool) {
         guard recorder == nil else { return }
+        if let free = freeDiskBytes(), free < stopDiskBytes {
+            if problem == nil { warn("Not recording: disk is full (\(gb(free)) free). Free up space.") }
+            return
+        }
+        warnedLowDisk = false
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd_HH-mm"
         let dir = outRoot.appendingPathComponent("\(f.string(from: Date()))_\(shortName(app))")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let r = Recorder(dir: dir)
+        r.onWriteFailure = { [weak self, weak r] error in
+            Task { @MainActor in if let r { self?.recordingFailed(r, error) } }
+        }
         if liveEnabled { startLive(r) }
         do {
             try r.start()
@@ -261,10 +346,12 @@ final class Controller {
 
     func watch() async {
         log("watching for calls. Recordings go to \(outRoot.path)")
+        checkInterrupted()
         var busyPolls = 0
         var lastBusy = Date()
         while true {
             let users = currentMicUsers()
+            checkDisk()
             if recorder == nil {
                 busyPolls = users.isEmpty ? 0 : busyPolls + 1
                 if busyPolls >= startAfterPolls, let first = users.first {
@@ -355,7 +442,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func refresh() {
         let recording = controller.recorder != nil
         if let button = item.button {
-            button.image = menuBarIcon(recording: recording)
+            button.image = menuBarIcon(recording: recording, warning: controller.problem != nil)
         }
 
         let menu = NSMenu()
@@ -364,6 +451,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             status = controller.manual ? "Recording (manual)" : "Recording \(shortName(controller.app))"
         } else {
             status = "Watching for calls"
+        }
+        if let problem = controller.problem {
+            let p = NSMenuItem(title: "⚠ " + problem, action: nil, keyEquivalent: "")
+            p.attributedTitle = NSAttributedString(string: "⚠ " + problem, attributes: [
+                .foregroundColor: NSColor.systemOrange, .font: NSFont.menuFont(ofSize: 0)])
+            menu.addItem(p)
+            menu.addItem(entry("Dismiss warning", #selector(dismissProblem)))
+            menu.addItem(.separator())
         }
         menu.addItem(NSMenuItem(title: status, action: nil, keyEquivalent: ""))
         if controller.transcribing > 0 {
@@ -434,6 +529,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.open(outRoot)
     }
     @objc func openLog() { NSWorkspace.shared.open(logURL) }
+    @objc func dismissProblem() { controller.dismissProblem() }
     @objc func toggleLogin() {
         do {
             if SMAppService.mainApp.status == .enabled { try SMAppService.mainApp.unregister() }
@@ -447,10 +543,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 /// Menu bar glyph matching the app icon: a speech bubble holding a small waveform.
-/// Template (adapts to light/dark) when idle; adds a red dot while recording.
-func menuBarIcon(recording: Bool) -> NSImage {
+/// Template (adapts to light/dark) when idle; adds a red dot while recording, an orange one when something needs attention.
+func menuBarIcon(recording: Bool, warning: Bool = false) -> NSImage {
     let img = NSImage(size: NSSize(width: 20, height: 18), flipped: false) { _ in
-        let ink = recording ? NSColor.labelColor : NSColor.black
+        let ink = recording || warning ? NSColor.labelColor : NSColor.black
         ink.setStroke()
         ink.setFill()
         let bubble = NSBezierPath(roundedRect: NSRect(x: 1.5, y: 4.5, width: 15, height: 11), xRadius: 3.5, yRadius: 3.5)
@@ -466,13 +562,16 @@ func menuBarIcon(recording: Bool) -> NSImage {
             NSBezierPath(roundedRect: NSRect(x: 5.25 + Double(i) * 3, y: 10 - h / 2, width: 1.5, height: h),
                          xRadius: 0.75, yRadius: 0.75).fill()
         }
-        if recording {
+        if warning {
+            NSColor.systemOrange.setFill()
+            NSBezierPath(ovalIn: NSRect(x: 13, y: 11, width: 7, height: 7)).fill()
+        } else if recording {
             NSColor.systemRed.setFill()
             NSBezierPath(ovalIn: NSRect(x: 13, y: 11, width: 7, height: 7)).fill()
         }
         return true
     }
-    img.isTemplate = !recording
+    img.isTemplate = !recording && !warning
     img.accessibilityDescription = "MeetRec"
     return img
 }
